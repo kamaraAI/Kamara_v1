@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import List, Dict, Any
 from app.supabase_client import get_supabase_admin
 from app.auth import verify_student_token
+from app.subscriptions.service import get_plan_name_from_row, get_subscription_row
 
 logger = logging.getLogger("KamaraLogger")
 dashboard_router = APIRouter(prefix="/api/v1/pages", tags=["Dashboard Page"])
@@ -57,59 +58,51 @@ async def get_student_dashboard_view(current_user: dict = Depends(verify_student
         plan_tier = "starter"
         try:
             # Optional table: some deployments do not have subscription tracking yet.
-            # what plan is in column
-            sub_query = supabase.table("subscriptions")\
-                .select("plan_id")\
-                .eq("user_id", student_id)\
-                .maybe_single()\
-                .execute()
-
-            if sub_query and getattr(sub_query, 'data', None):
-                plan_tier = sub_query.data.get("plan", "starter")
+            subscription_row = get_subscription_row(str(student_id), supabase=supabase)
+            plan_tier = get_plan_name_from_row(subscription_row, supabase=supabase)
         except Exception as subscription_error:
             logger.warning("Subscription lookup skipped for dashboard: %s", str(subscription_error))
 
-        # 🌟 Step C: High-Fidelity Mock Values (Swapped for database queries later!)
         mock_stats = {
             "hours_studied": 12.5,
             "questions_asked": 34,
-            "average_score": 78
+            "average_score": 78,
         }
-        
+
         mock_activity = [
             {
                 "id": "act_001",
                 "type": "chat",
                 "title": "Interrogated AI Tutor regarding Organic Chemistry mechanisms",
-                "timestamp": "2 hours ago"
+                "timestamp": "2 hours ago",
             },
             {
                 "id": "act_002",
                 "type": "upload",
                 "title": "Uploaded PHY 102 Lecture_Note_Week3.pdf",
-                "timestamp": "Yesterday"
+                "timestamp": "Yesterday",
             },
             {
                 "id": "act_003",
                 "type": "exam",
                 "title": "Completed Mock Quiz: Introduction to Computer Science",
-                "timestamp": "3 days ago"
-            }
+                "timestamp": "3 days ago",
+            },
         ]
-        
+
         mock_recommendations = [
             "Review weak areas in Calculus derivatives before your test",
             "Generate a fresh Mock Exam for GST 101 basic grammar principles",
-            "Continue your conversation with the AI Tutor on Thermodynamics"
+            "Continue your conversation with the AI Tutor on Thermodynamics",
         ]
 
-        # Step D: Package and return everything to the client
+        # Step B: Package and return everything to the client
         return {
             "full_name": full_name,
             "plan_tier": plan_tier,
             "stats": mock_stats,
             "recent_activity": mock_activity,
-            "recommended_topics": mock_recommendations
+            "recommended_topics": mock_recommendations,
         }
 
     except Exception as e:

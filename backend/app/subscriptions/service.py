@@ -55,7 +55,7 @@ def get_subscription_row(user_id: str, supabase=None) -> dict[str, Any]:
     try:
         response = _safe_execute(
             supabase.table("subscriptions")
-            .select("id, user_id, plan_id, plan, status, trial_started_at, trial_ends_at, current_period_start, current_period_end, created_at")
+            .select("id, user_id, plan_id, status, trial_started_at, trial_ends_at, current_period_start, current_period_end, created_at")
             .eq("user_id", user_id)
             .maybe_single()
         )
@@ -66,10 +66,6 @@ def get_subscription_row(user_id: str, supabase=None) -> dict[str, Any]:
 
 
 def get_plan_name_from_row(subscription_row: dict[str, Any], supabase=None) -> str:
-    direct_plan = subscription_row.get("plan")
-    if isinstance(direct_plan, str) and direct_plan.strip():
-        return normalize_plan_name(direct_plan)
-
     plan_id = subscription_row.get("plan_id")
     if not plan_id:
         return "starter"
@@ -324,4 +320,3 @@ def enforce_feature_access(
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=decision)
 
     return decision
-
