@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import Optional
 from app.supabase_client import get_supabase_admin
 from   app.auth  import verify_student_token # Your repaired token middleware
+from app.subscriptions.service import get_plan_name_from_row, get_subscription_row
 
 logger = logging.getLogger("KamaraLogger")
 profile_router = APIRouter(prefix="/api/v1/pages", tags=["Profile Page"])
@@ -55,16 +56,10 @@ async def get_user_profile_page(current_user: dict = Depends(verify_student_toke
         sub_status = "trial"
 
         try:
-            # Optional table: some deployments do not have subscription tracking yet.
-            sub_query = supabase.table("subscriptions")\
-                .select("plan", "status")\
-                .eq("user_id", student_id)\
-                .maybe_single()\
-                .execute()
-
-            if sub_query and getattr(sub_query, 'data', None):
-                plan_tier = sub_query.data.get("plan", "starter")
-                sub_status = sub_query.data.get("status", "trial")
+            subscription_row = get_subscription_row(str(student_id), supabase=supabase)
+            if subscription_row:
+                plan_tier = get_plan_name_from_row(subscription_row, supabase=supabase)
+                sub_status = str(subscription_row.get("status") or "trial").lower()
         except Exception as subscription_error:
             logger.warning("Subscription lookup skipped for profile: %s", str(subscription_error))
 

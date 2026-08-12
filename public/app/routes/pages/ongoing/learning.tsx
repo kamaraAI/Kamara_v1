@@ -197,6 +197,28 @@ function appendFloat32Chunks(existing: Float32Array, next: Float32Array) {
   return merged;
 }
 
+function trimFloat32Buffer(input: Float32Array, maxLength: number) {
+  if (input.length <= maxLength) {
+    return input;
+  }
+
+  return input.slice(input.length - maxLength);
+}
+
+function calculateRms(inputBuffer: Float32Array) {
+  if (inputBuffer.length === 0) {
+    return 0;
+  }
+
+  let sumSquares = 0;
+  for (let index = 0; index < inputBuffer.length; index += 1) {
+    const sample = inputBuffer[index] ?? 0;
+    sumSquares += sample * sample;
+  }
+
+  return Math.sqrt(sumSquares / inputBuffer.length);
+}
+
 async function blobToDataUrl(blob: Blob) {
   return await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -246,6 +268,9 @@ export default function DashboardPage() {
   const isSendingCanvasSnapshotRef = useRef(false);
   const micChunkCountRef = useRef(0);
   const micPendingSamplesRef = useRef<Float32Array>(new Float32Array(0));
+  const micPreRollSamplesRef = useRef<Float32Array>(new Float32Array(0));
+  const micIsSpeakingRef = useRef(false);
+  const micLastVoiceAtRef = useRef(0);
   const pendingBoardCommandsRef = useRef<unknown[]>([]);
   const previousSessionIdRef = useRef<string | null>(null);
 
@@ -623,18 +648,16 @@ export default function DashboardPage() {
 
   const stopMicStream = () => {
     const socket = tutorSocketRef.current;
-    if (socket && socket.readyState === WebSocket.OPEN && micPendingSamplesRef.current.length > 0) {
-      const audioContext = audioContextRef.current;
-      const pendingSamples = micPendingSamplesRef.current;
-      micPendingSamplesRef.current = new Float32Array(0);
-
-      const downsampled = downsampleBuffer(pendingSamples, audioContext?.sampleRate ?? 16000, 16000);
-      if (downsampled.length > 0) {
-        socket.send(float32To16BitPCM(downsampled));
-      }
-    }
-
     if (socket && socket.readyState === WebSocket.OPEN) {
+      while (micPendingSamplesRef.current.length > 0) {
+        const chunk = micPendingSamplesRef.current.slice(0, 1600);
+        micPendingSamplesRef.current = micPendingSamplesRef.current.slice(1600);
+
+        if (chunk.length > 0) {
+          socket.send(float32To16BitPCM(chunk));
+        }
+      }
+
       socket.send(JSON.stringify({ type: "audio_stream_end" }));
     }
 
@@ -648,6 +671,9 @@ export default function DashboardPage() {
     audioGainRef.current = null;
     audioContextRef.current = null;
     micPendingSamplesRef.current = new Float32Array(0);
+    micPreRollSamplesRef.current = new Float32Array(0);
+    micIsSpeakingRef.current = false;
+    micLastVoiceAtRef.current = 0;
 
     audioStreamRef.current?.getTracks().forEach((track) => track.stop());
     audioStreamRef.current = null;
@@ -963,6 +989,10 @@ export default function DashboardPage() {
       const processor = audioContext.createScriptProcessor(512, 1, 1);
       const silentGain = audioContext.createGain();
       silentGain.gain.value = 0;
+      const targetChunkSamples = 1600;
+      const preRollSamples = 2400;
+      const voiceThreshold = 0.006;
+      const silenceTimeoutMs = 550;
 
       processor.onaudioprocess = (event) => {
         if (socket.readyState !== WebSocket.OPEN) {
@@ -976,22 +1006,53 @@ export default function DashboardPage() {
           return;
         }
 
-        micPendingSamplesRef.current = appendFloat32Chunks(micPendingSamplesRef.current, downsampled);
+        const now = Date.now();
+        const rms = calculateRms(downsampled);
+        const isVoice = rms >= voiceThreshold;
 
-        const targetSamplesPerChunk = 1600;
-        while (micPendingSamplesRef.current.length >= targetSamplesPerChunk) {
-          const chunk = micPendingSamplesRef.current.slice(0, targetSamplesPerChunk);
-          micPendingSamplesRef.current = micPendingSamplesRef.current.slice(targetSamplesPerChunk);
-          socket.send(float32To16BitPCM(chunk));
+        micPreRollSamplesRef.current = trimFloat32Buffer(
+          appendFloat32Chunks(micPreRollSamplesRef.current, downsampled),
+          preRollSamples
+        );
 
-          micChunkCountRef.current += 1;
-          if (micChunkCountRef.current % 20 === 0) {
-            console.info("[Tutor WS] Sent mic chunk", {
-              chunkNumber: micChunkCountRef.current,
-              downsampledSamples: chunk.length,
-              byteLength: chunk.length * 2,
-            });
+        if (isVoice) {
+          if (!micIsSpeakingRef.current) {
+            micPendingSamplesRef.current = appendFloat32Chunks(micPreRollSamplesRef.current, micPendingSamplesRef.current);
+            micPreRollSamplesRef.current = new Float32Array(0);
+            micIsSpeakingRef.current = true;
           }
+
+          micLastVoiceAtRef.current = now;
+          micPendingSamplesRef.current = appendFloat32Chunks(micPendingSamplesRef.current, downsampled);
+
+          while (micPendingSamplesRef.current.length >= targetChunkSamples) {
+            const chunk = micPendingSamplesRef.current.slice(0, targetChunkSamples);
+            micPendingSamplesRef.current = micPendingSamplesRef.current.slice(targetChunkSamples);
+            socket.send(float32To16BitPCM(chunk));
+
+            micChunkCountRef.current += 1;
+            if (micChunkCountRef.current % 20 === 0) {
+              console.info("[Tutor WS] Sent mic chunk", {
+                chunkNumber: micChunkCountRef.current,
+                downsampledSamples: chunk.length,
+                byteLength: chunk.length * 2,
+              });
+            }
+          }
+        } else if (micIsSpeakingRef.current && now - micLastVoiceAtRef.current >= silenceTimeoutMs) {
+          while (micPendingSamplesRef.current.length > 0) {
+            const chunk = micPendingSamplesRef.current.slice(0, targetChunkSamples);
+            micPendingSamplesRef.current = micPendingSamplesRef.current.slice(targetChunkSamples);
+
+            if (chunk.length > 0) {
+              socket.send(float32To16BitPCM(chunk));
+            }
+          }
+
+          socket.send(JSON.stringify({ type: "audio_stream_end" }));
+          micIsSpeakingRef.current = false;
+          micLastVoiceAtRef.current = 0;
+          micPreRollSamplesRef.current = new Float32Array(0);
         }
       };
 
