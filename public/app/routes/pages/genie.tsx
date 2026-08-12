@@ -1,5 +1,5 @@
 import { DashboardSidebar, DashboardTopbar } from "./dash-component";
-import { BookOpen, BrainCircuit, FlaskConical, Atom, Grid3X3, Calculator, Plus } from "lucide-react";
+import { BookOpen, BrainCircuit, FlaskConical, Atom, Grid3X3, Calculator, Plus, Grid2x2, List } from "lucide-react";
 import { useState, useMemo, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { getGeneratedCourseStorageKey, submitCoursePrompt } from "./genie-api";
@@ -38,6 +38,7 @@ export default function CoursesPage() {
   const [selectedCourse, setSelectedCourse] = useState<Course | null>(null);
   const [submitError, setSubmitError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
 
   const filteredCourses = useMemo(() => {
     if (!searchQuery) {
@@ -95,18 +96,47 @@ export default function CoursesPage() {
       >
         <DashboardTopbar onMenuClick={() => setSidebarOpen(true)} onSearchChange={setSearchQuery} />
         <div className="p-6">
-          <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <h1 className="text-3xl font-bold text-slate-900">Genie</h1>
-            <button
-              type="button"
-              onClick={() => setIsGenieOpen((current) => !current)}
-              className="inline-flex items-center gap-2 rounded-full bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
-            >
-              <Plus size={16} aria-hidden="true" />
-              Add Genie
-            </button>
+          <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <h1 className="text-3xl font-bold text-slate-900">Genie</h1>
+              <p className="mt-2 text-sm text-slate-500">Switch between a grid or list view.</p>
+            </div>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+              <button
+                type="button"
+                onClick={() => setIsGenieOpen((current) => !current)}
+                className="inline-flex items-center gap-2 rounded-full bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
+              >
+                <Plus size={16} aria-hidden="true" />
+                Add Genie
+              </button>
+              <div className="inline-flex rounded-full border border-slate-200 bg-white p-1 shadow-sm">
+                <button
+                  type="button"
+                  onClick={() => setViewMode("grid")}
+                  className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition ${
+                    viewMode === "grid" ? "bg-blue-600 text-white" : "text-slate-600 hover:bg-slate-100"
+                  }`}
+                  aria-pressed={viewMode === "grid"}
+                >
+                  <Grid2x2 size={16} />
+                  Grid
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode("list")}
+                  className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition ${
+                    viewMode === "list" ? "bg-blue-600 text-white" : "text-slate-600 hover:bg-slate-100"
+                  }`}
+                  aria-pressed={viewMode === "list"}
+                >
+                  <List size={16} />
+                  List
+                </button>
+              </div>
+            </div>
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div className={viewMode === "grid" ? "grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3" : "space-y-4"}>
             {filteredCourses.map((course) => (
               <button
                 key={course.title}
@@ -115,14 +145,22 @@ export default function CoursesPage() {
                   setSubmitError("");
                   setSelectedCourse(course);
                 }}
-                className="bg-white rounded-lg shadow-md p-6 flex flex-col justify-between text-left hover:shadow-lg transition-shadow focus:outline-none focus:ring-4 focus:ring-blue-100"
+                className={`bg-white text-left shadow-md transition-shadow hover:shadow-lg focus:outline-none focus:ring-4 focus:ring-blue-100 ${
+                  viewMode === "grid"
+                    ? "flex flex-col justify-between rounded-2xl p-6"
+                    : "flex w-full flex-col gap-4 rounded-3xl p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6"
+                }`}
               >
-                <div>
-                  <div className="text-blue-600 mb-4">{course.icon}</div>
-                  <h2 className="text-lg font-semibold text-slate-800 mb-2">{course.title}</h2>
-                  <p className="text-sm text-slate-600 mb-4">{course.description}</p>
+                <div className={viewMode === "list" ? "flex min-w-0 flex-1 items-start gap-4" : ""}>
+                  <div className={`text-blue-600 ${viewMode === "grid" ? "mb-4" : "shrink-0"}`}>{course.icon}</div>
+                  <div className="min-w-0">
+                    <h2 className="text-lg font-semibold text-slate-800">{course.title}</h2>
+                    <p className="mt-2 text-sm text-slate-600">{course.description}</p>
+                  </div>
                 </div>
-                <span className="text-sm font-semibold text-blue-600 hover:text-blue-700 self-start">Open Course &rarr;</span>
+                <span className={`text-sm font-semibold text-blue-600 hover:text-blue-700 ${viewMode === "list" ? "self-start sm:self-center sm:whitespace-nowrap" : "self-start"}`}>
+                  Open Course &rarr;
+                </span>
               </button>
             ))}
             {filteredCourses.length === 0 && (
