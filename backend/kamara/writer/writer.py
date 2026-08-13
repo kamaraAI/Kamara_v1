@@ -12,10 +12,10 @@ from .source_loader import build_writer_content_bundle
 
 logger = logging.getLogger("KamaraLogger")
 
-WRITER_MODEL = os.getenv("OPENROUTER_WRITER_MODEL", "google/gemini-2.5-flash")
+WRITER_MODEL = os.getenv("OPENROUTER_WRITER_MODEL", 
+                        "deepseek/deepseek-v4-flash"
+                       )
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost:3000")
-OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "Kamara Backend")
 
 load_dotenv()
 
@@ -134,19 +134,97 @@ def _parse_writer_response(content: str) -> WriterResponseSchema:
     return WriterResponseSchema.model_validate(parsed)
 
 
+def _build_default_assessment_questions(subject: str, topic: str) -> list[str]:
+    return [
+        f"State, in your own words, the core idea of {topic} in {subject}.",
+        f"Work through one basic example involving {topic}, showing every step.",
+        f"Attempt one exam-style question on {topic} and check your reasoning against the notes.",
+    ]
+
+
+def _coerce_writer_payload(
+    parsed: dict,
+    *,
+    request: WriterRequestSchema,
+    bundle: WriterContentBundle,
+) -> dict:
+    if "sections" not in parsed and "modules" in parsed and "textbook_handout_notes" in parsed:
+        return {
+            "title": parsed.get("title") or f"{request.course.strip().title()} Study Guide",
+            "source_type": parsed.get("source_type") or bundle.source_type.value,
+            "source_summary": parsed.get("source_summary") or bundle.source_summary,
+            "modules": parsed.get("modules"),
+            "textbook_handout_notes": parsed.get("textbook_handout_notes"),
+            "assessment_questions": parsed.get("assessment_questions") or _build_default_assessment_questions(
+                request.course.strip().title(),
+                request.prompt.strip()[:90] or request.course.strip().title(),
+            ),
+        }
+
+    sections = parsed.get("sections")
+    if isinstance(sections, list) and sections:
+        modules: list[dict[str, str]] = []
+        notes_parts: list[str] = []
+
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+
+            section_title = (
+                section.get("title")
+                or section.get("sub_topic")
+                or section.get("heading")
+                or "Section"
+            )
+            section_notes = (
+                section.get("section_notes")
+                or section.get("notes")
+                or section.get("content")
+                or section.get("body")
+                or ""
+            )
+            if isinstance(section_notes, list):
+                section_notes = "\n".join(str(item) for item in section_notes)
+
+            section_notes_text = str(section_notes).strip()
+            if not section_notes_text:
+                section_notes_text = f"## {section_title}\n\nNo section notes were returned."
+
+            modules.append(
+                {
+                    "sub_topic": str(section_title).strip(),
+                    "section_notes": section_notes_text,
+                }
+            )
+            notes_parts.append(section_notes_text)
+
+        course_title = request.course.strip().title() or "Study Guide"
+        subject = request.course.strip().title() or "General Studies"
+        topic = request.prompt.strip()[:90] or subject
+
+        return {
+            "title": parsed.get("title") or f"{course_title} Study Guide",
+            "source_type": parsed.get("source_type") or bundle.source_type.value,
+            "source_summary": parsed.get("source_summary") or bundle.source_summary,
+            "modules": modules or [{"sub_topic": course_title, "section_notes": f"## {course_title}\n\nNo sections returned."}],
+            "textbook_handout_notes": parsed.get("textbook_handout_notes") or "\n\n".join(notes_parts) or f"# {course_title}\n\n{topic}",
+            "assessment_questions": parsed.get("assessment_questions")
+            or parsed.get("questions")
+            or _build_default_assessment_questions(subject, topic),
+        }
+
+    return parsed
+
+
 @lru_cache(maxsize=1)
-def _get_openrouter_client() -> AsyncOpenAI:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+def _get_agentrouter_client() -> AsyncOpenAI:
+    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("WRITER_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing OPENROUTER_API_KEY environment variable.")
+        raise RuntimeError("Missing OPENROUTER_API_KEY or WRITER_API_KEY environment variable.")
 
     return AsyncOpenAI(
         base_url=OPENROUTER_BASE_URL,
         api_key=api_key,
-        default_headers={
-            "HTTP-Referer": OPENROUTER_HTTP_REFERER,
-            "X-OpenRouter-Title": OPENROUTER_TITLE,
-        },
     )
 
 
@@ -168,7 +246,7 @@ async def run_writer_agent(request: WriterRequestSchema, user_id: str = "course-
 
         user_content = [{"type": "text", "text": user_prompt}, *_normalize_message_parts(bundle.contents)]
 
-        client = _get_openrouter_client()
+        client = _get_agentrouter_client()
         response = await client.chat.completions.create(
             model=WRITER_MODEL,
             messages=[
@@ -184,7 +262,10 @@ async def run_writer_agent(request: WriterRequestSchema, user_id: str = "course-
         content = getattr(message, "content", None)
 
         if isinstance(content, str) and content.strip():
-            return _parse_writer_response(content)
+            raw_json = _strip_code_fences(content)
+            parsed = json.loads(raw_json)
+            normalized = _coerce_writer_payload(parsed, request=request, bundle=bundle)
+            return WriterResponseSchema.model_validate(normalized)
 
         if isinstance(content, list):
             text_content = "".join(
@@ -192,7 +273,10 @@ async def run_writer_agent(request: WriterRequestSchema, user_id: str = "course-
                 for part in content
             ).strip()
             if text_content:
-                return _parse_writer_response(text_content)
+                raw_json = _strip_code_fences(text_content)
+                parsed = json.loads(raw_json)
+                normalized = _coerce_writer_payload(parsed, request=request, bundle=bundle)
+                return WriterResponseSchema.model_validate(normalized)
 
         raise RuntimeError("Writer agent returned an empty response.")
 
