@@ -1,9 +1,11 @@
+import asyncio
 import logging
 
 from fastapi import WebSocket
 from google.genai import types
 
 from connection.connect_manager import manager
+from kamara.tutor.tool_ack import clear_tool_result, register_tool_result
 
 from .delete_and_clear import clear_board, delete_board_item
 from .draw import draw_on_board
@@ -178,9 +180,16 @@ async def tools_handler(student_id: str, session, tool_call, websocket: WebSocke
                 }
 
             if payload:
+                tool_call_id = getattr(fc, "id", None)
+                frontend_result_future = (
+                    register_tool_result(student_id, tool_call_id)
+                    if isinstance(tool_call_id, str) and tool_call_id.strip()
+                    else None
+                )
                 browser_command = {
                     "type": "tool_call",
                     "name": fc.name,
+                    "tool_call_id": tool_call_id,
                     "action": payload.get("action"),
                     "data": payload.get("data", {}),
                     "payload": payload,
@@ -189,11 +198,33 @@ async def tools_handler(student_id: str, session, tool_call, websocket: WebSocke
                 await manager.send_json_message(browser_command, student_id)
                 logger.info("Broadcast tutor tool '%s' to student %s", fc.name, student_id)
 
-                gemini_receipt = {
-                    "success": "true",
-                    "action_executed": str(fc.name),
-                    "status_message": "Tool Call (Whiteboard updated successfully)",
-                }
+                if frontend_result_future:
+                    try:
+                        frontend_result = await asyncio.wait_for(frontend_result_future, timeout=3.0)
+                        frontend_success = bool(frontend_result.get("success"))
+                        gemini_receipt = {
+                            "success": "true" if frontend_success else "false",
+                            "action_executed": str(fc.name),
+                            "status_message": frontend_result.get("message")
+                            or (
+                                "Tool Call (Whiteboard updated successfully)"
+                                if frontend_success
+                                else "Tool Call reached frontend but was not applied."
+                            ),
+                        }
+                    except asyncio.TimeoutError:
+                        clear_tool_result(student_id, tool_call_id)
+                        gemini_receipt = {
+                            "success": "false",
+                            "action_executed": str(fc.name),
+                            "status_message": "Tool Call sent to frontend, but no frontend success acknowledgement was received.",
+                        }
+                else:
+                    gemini_receipt = {
+                        "success": "true",
+                        "action_executed": str(fc.name),
+                        "status_message": "Tool Call delivered to the frontend.",
+                    }
 
         except Exception as exc:
             logger.error("Whiteboard execution failed for tool %s: %s", fc.name, str(exc), exc_info=True)

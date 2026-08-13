@@ -30,6 +30,7 @@ logger = logging.getLogger("KamaraLogger")
 app = FastAPI(title="AI Agentic Microservice")
 
 # add kamara url
+
 KEEP_ALIVE_URL = os.environ.get("KEEP_ALIVE_URL", "https://kamara.onrender.com/health")
 KEEP_ALIVE_INTERVAL_SECONDS = int(os.environ.get("KEEP_ALIVE_INTERVAL_SECONDS", 600))
 ENABLE_KEEP_ALIVE = os.environ.get("ENABLE_KEEP_ALIVE", "true").lower() in ("1", "true", "yes")

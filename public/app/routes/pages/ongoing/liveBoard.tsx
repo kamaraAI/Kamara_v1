@@ -65,7 +65,7 @@ export type LiveBoardProps = {
   onEditorReady?: (editor: Editor | null) => void;
 };
 
-const READ_ONLY_MODE = atom<"readonly" | "readwrite">("board-readonly-mode", "readonly");
+const TUTOR_WRITE_MODE = atom<"readonly" | "readwrite">("board-tutor-write-mode", "readwrite");
 
 const FIXED_SHEET_STYLE = {
   width: "100%",
@@ -241,7 +241,7 @@ export function applyBoardCommand(editor: Editor, command: BoardCommand) {
 
 export default function LiveBoard({ onEditorReady }: LiveBoardProps) {
   const editorRef = useRef<Editor | null>(null);
-  const readOnlyStore = useMemo(
+  const tutorWritableStore = useMemo(
     () =>
       createTLStore({
         shapeUtils: defaultShapeUtils,
@@ -249,7 +249,7 @@ export default function LiveBoard({ onEditorReady }: LiveBoardProps) {
         assetUtils: defaultAssetUtils,
         collaboration: {
           status: null,
-          mode: READ_ONLY_MODE,
+          mode: TUTOR_WRITE_MODE,
         },
       }),
     []
@@ -286,8 +286,17 @@ export default function LiveBoard({ onEditorReady }: LiveBoardProps) {
         boxSizing: "border-box" as const,
       }}
     >
-      <div style={FIXED_SHEET_STYLE}>
-        <Tldraw hideUi isReadOnly={true} store={readOnlyStore} onMount={handleMount} />
+      <div style={{ ...FIXED_SHEET_STYLE, position: "relative" }}>
+        <Tldraw hideUi autoFocus={false} store={tutorWritableStore} onMount={handleMount} />
+        <div
+          aria-label="Tutor-controlled whiteboard"
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 10,
+            cursor: "default",
+          }}
+        />
       </div>
     </div>
   );

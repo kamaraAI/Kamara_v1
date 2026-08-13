@@ -58,6 +58,7 @@ const fallbackModules = placeholderModules;
 
 const WS_BASE_URL = getWebSocketBaseUrl();
 const COURSE_MODULES_WS_ENDPOINT = `${WS_BASE_URL}/courses/hrm/modules`;
+const CANVAS_SNAPSHOT_DEBOUNCE_MS = 750;
 function isAudioStreamingSupported() {
   return (
     typeof window !== "undefined" &&
@@ -265,7 +266,15 @@ export default function DashboardPage() {
   const assistantAudioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const boardSnapshotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastCanvasSnapshotTextRef = useRef<string>("");
-  const isSendingCanvasSnapshotRef = useRef(false);
+  const lastCanvasSnapshotVisionRef = useRef<string>("");
+  const isSendingCanvasTextSnapshotRef = useRef(false);
+  const isSendingCanvasVisionSnapshotRef = useRef(false);
+  const outboundAudioQueueRef = useRef<ArrayBuffer[]>([]);
+  const outboundCanvasQueueRef = useRef<string[]>([]);
+  const outboundControlQueueRef = useRef<string[]>([]);
+  const outboundAudioFlushScheduledRef = useRef(false);
+  const outboundCanvasFlushScheduledRef = useRef(false);
+  const outboundControlFlushScheduledRef = useRef(false);
   const micChunkCountRef = useRef(0);
   const micPendingSamplesRef = useRef<Float32Array>(new Float32Array(0));
   const micPreRollSamplesRef = useRef<Float32Array>(new Float32Array(0));
@@ -315,7 +324,15 @@ export default function DashboardPage() {
     disconnectTutorSession();
     pendingBoardCommandsRef.current = [];
     lastCanvasSnapshotTextRef.current = "";
-    isSendingCanvasSnapshotRef.current = false;
+    lastCanvasSnapshotVisionRef.current = "";
+    isSendingCanvasTextSnapshotRef.current = false;
+    isSendingCanvasVisionSnapshotRef.current = false;
+    outboundAudioQueueRef.current = [];
+    outboundCanvasQueueRef.current = [];
+    outboundControlQueueRef.current = [];
+    outboundAudioFlushScheduledRef.current = false;
+    outboundCanvasFlushScheduledRef.current = false;
+    outboundControlFlushScheduledRef.current = false;
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -367,6 +384,79 @@ export default function DashboardPage() {
       clearTimeout(boardSnapshotTimerRef.current);
       boardSnapshotTimerRef.current = null;
     }
+  };
+
+  const flushQueuedOutboundFrames = (kind: "audio" | "canvas" | "control") => {
+    const socket = tutorSocketRef.current;
+
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    if (kind === "audio") {
+      outboundAudioFlushScheduledRef.current = false;
+      while (outboundAudioQueueRef.current.length > 0 && socket.readyState === WebSocket.OPEN) {
+        const frame = outboundAudioQueueRef.current.shift();
+        if (frame) {
+          socket.send(frame);
+        }
+      }
+      return;
+    }
+
+    if (kind === "canvas") {
+      outboundCanvasFlushScheduledRef.current = false;
+      while (outboundCanvasQueueRef.current.length > 0 && socket.readyState === WebSocket.OPEN) {
+        const frame = outboundCanvasQueueRef.current.shift();
+        if (frame) {
+          socket.send(frame);
+        }
+      }
+      return;
+    }
+
+    outboundControlFlushScheduledRef.current = false;
+    while (outboundControlQueueRef.current.length > 0 && socket.readyState === WebSocket.OPEN) {
+      const frame = outboundControlQueueRef.current.shift();
+      if (frame) {
+        socket.send(frame);
+      }
+    }
+  };
+
+  const scheduleOutboundFlush = (kind: "audio" | "canvas" | "control") => {
+    const flagRef =
+      kind === "audio"
+        ? outboundAudioFlushScheduledRef
+        : kind === "canvas"
+          ? outboundCanvasFlushScheduledRef
+          : outboundControlFlushScheduledRef;
+
+    if (flagRef.current) {
+      return;
+    }
+
+    flagRef.current = true;
+    queueMicrotask(() => {
+      flushQueuedOutboundFrames(kind);
+    });
+  };
+
+  const enqueueOutboundJson = (kind: "canvas" | "control", payload: unknown) => {
+    const frame = JSON.stringify(payload);
+
+    if (kind === "canvas") {
+      outboundCanvasQueueRef.current.push(frame);
+    } else {
+      outboundControlQueueRef.current.push(frame);
+    }
+
+    scheduleOutboundFlush(kind);
+  };
+
+  const enqueueOutboundAudio = (frame: ArrayBuffer) => {
+    outboundAudioQueueRef.current.push(frame);
+    scheduleOutboundFlush("audio");
   };
 
   const ensureAssistantAudioContext = async () => {
@@ -496,6 +586,35 @@ export default function DashboardPage() {
     return null;
   };
 
+  const getToolCallId = (payload: unknown) => {
+    if (!payload || typeof payload !== "object") {
+      return null;
+    }
+
+    const candidate = payload as {
+      tool_call_id?: unknown;
+      id?: unknown;
+    };
+
+    const toolCallId = candidate.tool_call_id ?? candidate.id;
+    return typeof toolCallId === "string" && toolCallId.trim() ? toolCallId : null;
+  };
+
+  const sendToolResult = (payload: unknown, success: boolean, message: string) => {
+    const toolCallId = getToolCallId(payload);
+
+    if (!toolCallId) {
+      return;
+    }
+
+    enqueueOutboundJson("control", {
+      type: "tool_result",
+      tool_call_id: toolCallId,
+      success,
+      message,
+    });
+  };
+
   const applyBoardPayload = (payload: unknown) => {
     const command = extractBoardCommand(payload);
 
@@ -503,7 +622,7 @@ export default function DashboardPage() {
       if (payload && typeof payload === "object") {
         pendingBoardCommandsRef.current.push(payload);
       }
-      return;
+      return false;
     }
 
     const candidate = command as Partial<BoardCommand> & {
@@ -512,7 +631,8 @@ export default function DashboardPage() {
     };
 
     if (!candidate.action) {
-      return;
+      sendToolResult(payload, false, "Whiteboard command was missing an action.");
+      return false;
     }
 
     if (
@@ -526,10 +646,18 @@ export default function DashboardPage() {
     ) {
       try {
         applyBoardCommand(boardEditor, candidate as BoardCommand);
+        sendToolResult(payload, true, "Whiteboard command applied on the frontend.");
+        scheduleBoardSnapshot();
+        return true;
       } catch (error) {
         console.error("Could not apply tutor board command", error);
+        sendToolResult(payload, false, error instanceof Error ? error.message : "Whiteboard command failed on the frontend.");
+        return false;
       }
     }
+
+    sendToolResult(payload, false, `Unsupported whiteboard action: ${candidate.action}`);
+    return false;
   };
 
   const normalizeCanvasShape = (shape: any) => {
@@ -590,7 +718,7 @@ export default function DashboardPage() {
 
   const executeCanvasScript = (javascriptCode: string) => {
     if (!boardEditor || !javascriptCode.trim()) {
-      return;
+      return false;
     }
 
     try {
@@ -624,12 +752,15 @@ export default function DashboardPage() {
 
       const runner = new Function("editor", javascriptCode);
       runner(safeEditor);
+      scheduleBoardSnapshot();
+      return true;
     } catch (error) {
       console.error("Could not execute canvas JavaScript:", error);
       setTutorNotice({
         type: "warning",
         message: "A whiteboard command used an older text format. The board stayed open, but that command was skipped.",
       });
+      return false;
     }
   };
 
@@ -654,11 +785,11 @@ export default function DashboardPage() {
         micPendingSamplesRef.current = micPendingSamplesRef.current.slice(1600);
 
         if (chunk.length > 0) {
-          socket.send(float32To16BitPCM(chunk));
+          enqueueOutboundAudio(float32To16BitPCM(chunk));
         }
       }
 
-      socket.send(JSON.stringify({ type: "audio_stream_end" }));
+      enqueueOutboundJson("control", { type: "audio_stream_end" });
     }
 
     audioProcessorRef.current?.disconnect();
@@ -688,7 +819,15 @@ export default function DashboardPage() {
     stopAssistantAudio();
     pendingBoardCommandsRef.current = [];
     lastCanvasSnapshotTextRef.current = "";
-    isSendingCanvasSnapshotRef.current = false;
+    lastCanvasSnapshotVisionRef.current = "";
+    isSendingCanvasTextSnapshotRef.current = false;
+    isSendingCanvasVisionSnapshotRef.current = false;
+    outboundAudioQueueRef.current = [];
+    outboundCanvasQueueRef.current = [];
+    outboundControlQueueRef.current = [];
+    outboundAudioFlushScheduledRef.current = false;
+    outboundCanvasFlushScheduledRef.current = false;
+    outboundControlFlushScheduledRef.current = false;
 
     const socket = tutorSocketRef.current;
     tutorSocketRef.current = null;
@@ -700,18 +839,18 @@ export default function DashboardPage() {
     }
   };
 
-  const sendCanvasSnapshots = async () => {
+  const sendCanvasTextSnapshot = async () => {
     const socket = tutorSocketRef.current;
 
     if (!boardEditor || !socket || socket.readyState !== WebSocket.OPEN) {
       return;
     }
 
-    if (isSendingCanvasSnapshotRef.current) {
+    if (isSendingCanvasTextSnapshotRef.current) {
       return;
     }
 
-    isSendingCanvasSnapshotRef.current = true;
+    isSendingCanvasTextSnapshotRef.current = true;
 
     try {
       const snapshot = await serializeTldrawJson(boardEditor);
@@ -721,13 +860,31 @@ export default function DashboardPage() {
 
       lastCanvasSnapshotTextRef.current = snapshot;
 
-      socket.send(
-        JSON.stringify({
-          type: "canvas_snapshot_text",
-          data: snapshot,
-        })
-      );
+      enqueueOutboundJson("canvas", {
+        type: "canvas_snapshot_text",
+        data: snapshot,
+      });
+    } catch (error) {
+      console.error("Could not serialize board snapshot:", error);
+    } finally {
+      isSendingCanvasTextSnapshotRef.current = false;
+    }
+  };
 
+  const sendCanvasVisionSnapshot = async () => {
+    const socket = tutorSocketRef.current;
+
+    if (!boardEditor || !socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    if (isSendingCanvasVisionSnapshotRef.current) {
+      return;
+    }
+
+    isSendingCanvasVisionSnapshotRef.current = true;
+
+    try {
       const shapeIds = [...boardEditor.getCurrentPageShapeIds()];
       if (shapeIds.length === 0) {
         return;
@@ -744,21 +901,32 @@ export default function DashboardPage() {
       }
 
       const image = await blobToDataUrl(imageResult.blob);
+      if (image === lastCanvasSnapshotVisionRef.current) {
+        return;
+      }
 
-      socket.send(
-        JSON.stringify({
-          type: "canvas_snapshot_vision",
-          image,
-        })
-      );
+      lastCanvasSnapshotVisionRef.current = image;
+
+      enqueueOutboundJson("canvas", {
+        type: "canvas_snapshot_vision",
+        image,
+      });
     } catch (error) {
-      console.error("Could not serialize board snapshot:", error);
+      console.error("Could not serialize board vision snapshot:", error);
     } finally {
-      isSendingCanvasSnapshotRef.current = false;
+      isSendingCanvasVisionSnapshotRef.current = false;
     }
   };
 
-  const scheduleBoardSnapshot = () => {};
+  const scheduleBoardSnapshot = () => {
+    clearBoardSnapshotTimer();
+
+    boardSnapshotTimerRef.current = setTimeout(() => {
+      boardSnapshotTimerRef.current = null;
+      void sendCanvasTextSnapshot();
+      void sendCanvasVisionSnapshot();
+    }, CANVAS_SNAPSHOT_DEBOUNCE_MS);
+  };
 
   const connectTutorSession = async () => {
     if (typeof window === "undefined" || !("WebSocket" in window)) {
@@ -823,6 +991,10 @@ export default function DashboardPage() {
           })
         );
 
+        flushQueuedOutboundFrames("audio");
+        flushQueuedOutboundFrames("canvas");
+        flushQueuedOutboundFrames("control");
+
         void ensureAssistantAudioContext();
         resolve(true);
       };
@@ -861,6 +1033,16 @@ export default function DashboardPage() {
 
           if (payload.type === "assistant_audio") {
             void playAssistantAudio(payload as AssistantAudioPayload);
+            return;
+          }
+
+          if (payload.type === "exec_js") {
+            const success = executeCanvasScript(String(payload.code ?? ""));
+            sendToolResult(
+              payload,
+              success,
+              success ? "Canvas JavaScript applied on the frontend." : "Canvas JavaScript could not be applied on the frontend."
+            );
             return;
           }
 
@@ -917,6 +1099,8 @@ export default function DashboardPage() {
         scope: "document",
       }
     );
+
+    scheduleBoardSnapshot();
 
     return () => {
       removeListener();
@@ -1028,7 +1212,7 @@ export default function DashboardPage() {
           while (micPendingSamplesRef.current.length >= targetChunkSamples) {
             const chunk = micPendingSamplesRef.current.slice(0, targetChunkSamples);
             micPendingSamplesRef.current = micPendingSamplesRef.current.slice(targetChunkSamples);
-            socket.send(float32To16BitPCM(chunk));
+            enqueueOutboundAudio(float32To16BitPCM(chunk));
 
             micChunkCountRef.current += 1;
             if (micChunkCountRef.current % 20 === 0) {
@@ -1045,11 +1229,11 @@ export default function DashboardPage() {
             micPendingSamplesRef.current = micPendingSamplesRef.current.slice(targetChunkSamples);
 
             if (chunk.length > 0) {
-              socket.send(float32To16BitPCM(chunk));
+              enqueueOutboundAudio(float32To16BitPCM(chunk));
             }
           }
 
-          socket.send(JSON.stringify({ type: "audio_stream_end" }));
+          enqueueOutboundJson("control", { type: "audio_stream_end" });
           micIsSpeakingRef.current = false;
           micLastVoiceAtRef.current = 0;
           micPreRollSamplesRef.current = new Float32Array(0);

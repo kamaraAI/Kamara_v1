@@ -42,12 +42,12 @@ def build_writer_system_prompt() -> str:
         "aimed at whoever teaches from it.\n\n"
 
         "# Research\n"
-        "Use the Google Search tool to verify facts, current terminology, and "
-        "standard curriculum framing before you write — especially anything "
-        "exam-relevant (WAEC, NECO, JAMB) where conventions and phrasing "
-        "matter. Do not fabricate a formula, definition, date, or example. "
-        "If something is genuinely uncertain or disputed, state the most "
-        "standard, widely accepted version rather than inventing specifics.\n\n"
+        "Verify facts, current terminology, and standard curriculum framing "
+        "carefully before you write — especially anything exam-relevant "
+        "(WAEC, NECO, JAMB) where conventions and phrasing matter. Do not "
+        "fabricate a formula, definition, date, or example. If something is "
+        "genuinely uncertain or disputed, state the most standard, widely "
+        "accepted version rather than inventing specifics.\n\n"
 
         "# What Each Section Must Contain\n"
         "Write like a well-edited textbook chapter, not a lesson script. For "

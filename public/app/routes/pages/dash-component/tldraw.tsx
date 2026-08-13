@@ -18,7 +18,7 @@ import 'tldraw/tldraw.css';
 import { getGeneratedCourseStorageKey } from '../genie-api';
 
 const WS_BASE_URL = getWebSocketBaseUrl();
-const READ_ONLY_MODE = atom<'readonly' | 'readwrite'>('board-readonly-mode', 'readonly');
+const TUTOR_WRITE_MODE = atom<'readonly' | 'readwrite'>('board-tutor-write-mode', 'readwrite');
 // will add cloud run url 
 type BoardCommand =
   | {
@@ -314,7 +314,7 @@ function applyBoardCommand(editor: Editor, command: BoardCommand) {
 const TldrawComponent = ({ sessionId, onEditorReady }: TldrawComponentProps) => {
   const socketRef = useRef<WebSocket | null>(null);
   const editorRef = useRef<Editor | null>(null);
-  const readOnlyStore = useMemo(
+  const tutorWritableStore = useMemo(
     () =>
       createTLStore({
         shapeUtils: defaultShapeUtils,
@@ -322,7 +322,7 @@ const TldrawComponent = ({ sessionId, onEditorReady }: TldrawComponentProps) => 
         assetUtils: defaultAssetUtils,
         collaboration: {
           status: null,
-          mode: READ_ONLY_MODE,
+          mode: TUTOR_WRITE_MODE,
         },
       }),
     []
@@ -447,12 +447,21 @@ const TldrawComponent = ({ sessionId, onEditorReady }: TldrawComponentProps) => 
 
   return (
     <div style={{ width: '100%', height: '100%', minHeight: 0, display: 'flex', alignItems: 'stretch', justifyContent: 'center', overflow: 'hidden', padding: 12, boxSizing: 'border-box' as const }}>
-      <div style={FIXED_SHEET_STYLE}>
+      <div style={{ ...FIXED_SHEET_STYLE, position: 'relative' }}>
         <Tldraw
           hideUi
-          isReadOnly={true}
-          store={readOnlyStore}
+          autoFocus={false}
+          store={tutorWritableStore}
           onMount={handleMount}
+        />
+        <div
+          aria-label="Tutor-controlled whiteboard"
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 10,
+            cursor: 'default',
+          }}
         />
       </div>
     </div>

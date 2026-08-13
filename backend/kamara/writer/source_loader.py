@@ -1,24 +1,17 @@
 from __future__ import annotations
 
-import tempfile
+import base64
+import io
 from pathlib import Path
 from urllib.parse import urlparse
-from google import genai
 
 import httpx
 from dotenv import load_dotenv
-import os
-from google.genai import Client,types
+from pypdf import PdfReader
 
 from .schemas import WriterContentBundle, WriterSourceType
 
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-client = Client(api_key=api_key,http_options={"api_version": "v1alpha"})
-
-
-
-
 
 IMAGE_EXTENSIONS = {
     ".jpg": "image/jpeg",
@@ -74,7 +67,7 @@ def _build_text_bundle(prompt: str, helper_text: str | None = None) -> WriterCon
         return WriterContentBundle(
             source_type=WriterSourceType.mixed,
             source_summary=source_summary,
-            contents=[helper_text],
+            contents=[{"type": "text", "text": helper_text}],
         )
 
     return WriterContentBundle(
@@ -83,7 +76,40 @@ def _build_text_bundle(prompt: str, helper_text: str | None = None) -> WriterCon
         contents=[],
     )
 
-# we would need to add youtube and external tutorial links as well as other sources in the future. 
+
+def _build_image_bundle(source_name: str, raw_bytes: bytes, content_type: str | None) -> WriterContentBundle:
+    mime_type = content_type or "image/png"
+    data_url = f"data:{mime_type};base64,{base64.b64encode(raw_bytes).decode('ascii')}"
+
+    return WriterContentBundle(
+        source_type=WriterSourceType.mixed,
+        source_summary=f"Image attachment: {source_name}",
+        contents=[
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": data_url,
+                },
+            }
+        ],
+    )
+
+
+def _extract_pdf_text(raw_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        page_text: list[str] = []
+
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if text.strip():
+                page_text.append(text.strip())
+
+        extracted = "\n\n".join(page_text).strip()
+        return extracted[:120_000]
+    except Exception:
+        return ""
+
 
 async def build_writer_content_bundle(prompt: str, helper_material_url: str | None = None) -> WriterContentBundle:
     if not helper_material_url:
@@ -94,34 +120,22 @@ async def build_writer_content_bundle(prompt: str, helper_material_url: str | No
     suffix = _guess_extension(helper_material_url, content_type)
 
     if suffix in IMAGE_EXTENSIONS:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".png") as temp_file:
-            temp_file.write(raw_bytes)
-            temp_path = Path(temp_file.name)
-
-        try:
-            uploaded_file = await client.files.upload(file=temp_path)
-            return WriterContentBundle(
-                source_type=WriterSourceType.mixed,
-                source_summary=f"Image attachment: {source_name}",
-                contents=[uploaded_file],
-            )
-        finally:
-            temp_path.unlink(missing_ok=True)
+        return _build_image_bundle(source_name, raw_bytes, IMAGE_EXTENSIONS[suffix])
 
     if suffix == ".pdf" or content_type == "application/pdf":
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-            temp_file.write(raw_bytes)
-            temp_path = Path(temp_file.name)
-
-        try:
-            uploaded_file = client.files.upload(file=temp_path)
+        extracted_text = _extract_pdf_text(raw_bytes)
+        if extracted_text:
             return WriterContentBundle(
                 source_type=WriterSourceType.mixed,
                 source_summary=f"PDF attachment: {source_name}",
-                contents=[uploaded_file],
+                contents=[{"type": "text", "text": extracted_text}],
             )
-        finally:
-            temp_path.unlink(missing_ok=True)
+
+        return WriterContentBundle(
+            source_type=WriterSourceType.mixed,
+            source_summary=f"PDF attachment: {source_name} (text extraction unavailable)",
+            contents=[],
+        )
 
     if suffix in TEXT_EXTENSIONS or (content_type and content_type.startswith("text/")):
         try:
