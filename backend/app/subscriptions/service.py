@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import HTTPException, status
-
 from app.supabase_client import get_supabase_admin
 
 from .plans import PLAN_CATALOG, normalize_feature_name, normalize_plan_name
@@ -89,21 +87,7 @@ def get_usage_count(
     period_start: datetime | None = None,
     supabase=None,
 ) -> int:
-    supabase = supabase or get_supabase_admin()
-
-    try:
-        query = supabase.table("subscription_usage_events").select("id", count="exact").eq("user_id", user_id).eq("feature_key", usage_key)
-        if period_start is not None:
-            query = query.gte("created_at", period_start.isoformat())
-
-        response = _safe_execute(query)
-        count = getattr(response, "count", None)
-        if isinstance(count, int):
-            return count
-        return len(getattr(response, "data", None) or [])
-    except Exception as exc:
-        logger.warning("Usage lookup failed for %s/%s: %s", user_id, usage_key, exc)
-        return 0
+    return 0
 
 
 def record_usage_event(
@@ -113,18 +97,7 @@ def record_usage_event(
     quantity: int = 1,
     supabase=None,
 ) -> None:
-    supabase = supabase or get_supabase_admin()
-    try:
-        supabase.table("subscription_usage_events").insert(
-            {
-                "user_id": user_id,
-                "feature_key": usage_key,
-                "quantity": quantity,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ).execute()
-    except Exception as exc:
-        logger.warning("Usage event insert skipped for %s/%s: %s", user_id, usage_key, exc)
+    return None
 
 
 def expire_due_trials(*, supabase=None, now: datetime | None = None) -> int:
@@ -195,103 +168,17 @@ def evaluate_feature_access(
     has_external_source: bool = False,
     supabase=None,
 ) -> dict[str, Any]:
-    supabase = supabase or get_supabase_admin()
-    summary = get_subscription_summary(user_id, supabase=supabase)
-    feature_key = normalize_feature_name(feature_name)
-    plan_config = PLAN_CATALOG.get(summary.plan_tier, PLAN_CATALOG["starter"])
-    status_name = summary.subscription_status
-    now = datetime.now(timezone.utc)
-
-    trial_ends_at = _parse_datetime(summary.trial_ends_at)
-    if status_name == "trial" and trial_ends_at is not None and trial_ends_at <= now:
-        status_name = "expired"
-
-    if status_name == "expired" and summary.plan_tier != "pro":
-        return {
-            "allowed": False,
-            "error_code": "subscription_required",
-            "reason": "trial_expired",
-            "required_plan": "pro",
-            "feature": feature_key,
-            "plan_tier": summary.plan_tier,
-            "subscription_status": status_name,
-            "message": "Your trial has ended. Upgrade to Pro to continue.",
-            "remaining": 0,
-            "limit": plan_config.get("message_limit"),
-        }
-
-    if feature_key == "message_send":
-        limit = plan_config.get("message_limit")
-        used = int(summary.usage.get("message_send") or 0)
-        next_total = used + quantity
-        if isinstance(limit, int) and next_total > limit:
-            return {
-                "allowed": False,
-                "error_code": "subscription_required",
-                "reason": "message_limit_reached",
-                "required_plan": "pro",
-                "feature": feature_key,
-                "plan_tier": summary.plan_tier,
-                "subscription_status": status_name,
-                "message": f"Starter plan includes only {limit} messages. Upgrade to Pro to keep sending messages.",
-                "used": used,
-                "limit": limit,
-                "remaining": max(limit - used, 0),
-            }
-
-    if feature_key == "external_source" and not bool(plan_config.get("allow_external_sources")):
-        return {
-            "allowed": False,
-            "error_code": "subscription_required",
-            "reason": "external_sources_blocked",
-            "required_plan": "pro",
-            "feature": feature_key,
-            "plan_tier": summary.plan_tier,
-            "subscription_status": status_name,
-            "message": "External sources are available on Pro only.",
-        }
-
-    if feature_key == "pdf_upload":
-        max_pdf_mb = plan_config.get("max_pdf_mb")
-        if isinstance(size_bytes, int) and isinstance(max_pdf_mb, int) and size_bytes > max_pdf_mb * 1024 * 1024:
-            return {
-                "allowed": False,
-                "error_code": "subscription_required",
-                "reason": "pdf_size_limit",
-                "required_plan": "pro",
-                "feature": feature_key,
-                "plan_tier": summary.plan_tier,
-                "subscription_status": status_name,
-                "message": f"PDF uploads above {max_pdf_mb} MB require Pro.",
-                "limit_mb": max_pdf_mb,
-            }
-
-    if feature_key == "note_size":
-        max_note_chars = plan_config.get("max_note_chars")
-        if isinstance(content_chars, int) and isinstance(max_note_chars, int) and content_chars > max_note_chars:
-            return {
-                "allowed": False,
-                "error_code": "subscription_required",
-                "reason": "note_size_limit",
-                "required_plan": "pro",
-                "feature": feature_key,
-                "plan_tier": summary.plan_tier,
-                "subscription_status": status_name,
-                "message": f"That note is too large for the Starter plan. Upgrade to Pro to publish larger notes.",
-                "limit_chars": max_note_chars,
-            }
-
     return {
         "allowed": True,
         "error_code": None,
         "reason": None,
         "required_plan": None,
-        "feature": feature_key,
-        "plan_tier": summary.plan_tier,
-        "subscription_status": status_name,
+        "feature": normalize_feature_name(feature_name),
+        "plan_tier": "open",
+        "subscription_status": "open",
         "message": None,
-        "used": summary.usage.get(feature_key) if feature_key in summary.usage else None,
-        "limit": plan_config.get("message_limit") if feature_key == "message_send" else None,
+        "used": None,
+        "limit": None,
         "remaining": None,
     }
 
@@ -306,7 +193,7 @@ def enforce_feature_access(
     has_external_source: bool = False,
     supabase=None,
 ) -> dict[str, Any]:
-    decision = evaluate_feature_access(
+    return evaluate_feature_access(
         user_id,
         feature_name,
         quantity=quantity,
@@ -315,8 +202,3 @@ def enforce_feature_access(
         has_external_source=has_external_source,
         supabase=supabase,
     )
-
-    if not decision["allowed"]:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=decision)
-
-    return decision

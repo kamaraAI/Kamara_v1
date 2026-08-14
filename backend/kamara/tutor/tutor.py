@@ -10,7 +10,6 @@ from starlette.websockets import WebSocketState
 from .response_handler import receive_response_from_ai
 from .session_resume_store import load_session_resumption_handle
 from .task_handler import forward_frontend_mic_and_canvas_to_gemini
-from .toolset.tools import tools
 
 load_dotenv()
 logger = logging.getLogger("KamaraLogger")
@@ -29,14 +28,23 @@ async def agent(student_id: str, websocket: WebSocket, system_prompt: str, sessi
     model = "gemini-3.1-flash-live-preview"
     reconnect_attempt = 0
     resume_handle = await load_session_resumption_handle(student_id, session_id)
+    voice_only_prompt = f"{system_prompt}\n\n"
+    
+    #(
+   #     "TEMPORARY SESSION MODE: Ignore any whiteboard, canvas, drawing, or tool instructions. "
+  #      "Do not call tools. Focus only on hearing the student's microphone input and speaking back continuously by audio.\n\n"
+  #      f"{system_prompt}"
+   # )
 
     while websocket.client_state == WebSocketState.CONNECTED:
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
             realtime_input_config={
                 "automatic_activity_detection": {
-                    "disabled": False,
+                    "disabled": True,   # False
                     "start_of_speech_sensitivity": types.StartSensitivity.START_SENSITIVITY_LOW,
                     "end_of_speech_sensitivity": types.EndSensitivity.END_SENSITIVITY_LOW,
                     "prefix_padding_ms": 120,
@@ -51,12 +59,11 @@ async def agent(student_id: str, websocket: WebSocket, system_prompt: str, sessi
                 handle=resume_handle,
             ),
             system_instruction=types.Content(
-                parts=[types.Part.from_text(text=system_prompt)]
+                parts=[types.Part.from_text(text=voice_only_prompt)]
             ),
             speech_config={
                 "voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}
             },
-            tools=[tools],
         )
 
         try:
@@ -103,7 +110,7 @@ async def agent(student_id: str, websocket: WebSocket, system_prompt: str, sessi
                 break
 
             reconnect_attempt += 1
-            if reconnect_attempt > 6:
+            if reconnect_attempt > 10:
                 logger.error("Gemini reconnect limit reached for %s. Ending live session.", student_id)
                 break
 

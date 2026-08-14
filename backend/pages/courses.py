@@ -8,7 +8,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.auth import verify_student_token
 from app.supabase_client import get_supabase_admin
-from app.subscriptions.service import enforce_feature_access, record_usage_event
 from kamara.writer.writer import run_writer_agent
 from kamara.writer.schemas import WriterRequestSchema
 
@@ -51,14 +50,6 @@ async def generate_course_modules(
         finished_successfully = False
 
         try:
-            enforce_feature_access(
-                str(student_id),
-                "course_generation",
-                has_external_source=bool(payload.helper_material_url),
-                supabase=supabase,
-            )
-            record_usage_event(str(student_id), "message_send", supabase=supabase)
-
             yield f"data: {json.dumps({'status': 'init', 'message': 'Waking up Kamara Writer Agent...'})}\n\n"
             await asyncio.sleep(0.3)
 
@@ -100,13 +91,6 @@ async def generate_course_modules(
 
             modules_list = agent_response.modules
             full_textbook_notes = agent_response.textbook_handout_notes
-
-            enforce_feature_access(
-                str(student_id),
-                "note_size",
-                content_chars=len(full_textbook_notes or ""),
-                supabase=supabase,
-            )
 
             yield f"data: {json.dumps({'status': 'processing', 'message': 'Research completed! Unpacking your structured study modules...'})}\n\n"
             await asyncio.sleep(0.5)
