@@ -148,6 +148,25 @@ def _coerce_writer_payload(
     request: WriterRequestSchema,
     bundle: WriterContentBundle,
 ) -> dict:
+    notes_text = parsed.get("textbook_handout_notes") or parsed.get("notes")
+
+    if isinstance(notes_text, list):
+        notes_text = "\n\n".join(str(item) for item in notes_text)
+
+    if isinstance(notes_text, str) and notes_text.strip() and not parsed.get("modules") and not parsed.get("sections"):
+        fallback = _fallback_syllabus(request.prompt)
+        return {
+            "title": parsed.get("title") or fallback.title,
+            "source_type": parsed.get("source_type") or bundle.source_type.value,
+            "source_summary": parsed.get("source_summary") or bundle.source_summary,
+            "modules": parsed.get("modules")
+            or [module.model_dump() for module in fallback.modules],
+            "textbook_handout_notes": notes_text.strip(),
+            "assessment_questions": parsed.get("assessment_questions")
+            or parsed.get("questions")
+            or fallback.assessment_questions,
+        }
+
     if "sections" not in parsed and "modules" in parsed and "textbook_handout_notes" in parsed:
         return {
             "title": parsed.get("title") or f"{request.course.strip().title()} Study Guide",

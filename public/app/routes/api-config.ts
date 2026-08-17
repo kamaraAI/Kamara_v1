@@ -17,7 +17,7 @@ export function getBaseUrl() {
     }
   }
 
-  return PRODUCTION_API_URL;
+  return LOCAL_API_URL;
 }
 
 /**
@@ -32,7 +32,7 @@ export function getWebSocketBaseUrl() {
     }
   }
 
-  return PRODUCTION_WEBSOCKET_URL;
+  return LOCAL_WEBSOCKET_URL;
 }
 
 

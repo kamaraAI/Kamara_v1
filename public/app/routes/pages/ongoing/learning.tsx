@@ -23,7 +23,7 @@ import {
   Video,
   MicOff,
 } from "lucide-react";
-import { type Editor, serializeTldrawJson, toRichText } from "tldraw";
+import { type Editor, toRichText } from "tldraw";
 
 import LiveBoard, { applyBoardCommand, type BoardCommand } from "./liveBoard";
 import ModuleLibrary, { buildModulesFromBackendResponse, placeholderModules, type LearningModule } from "../dash-component/mod-lib";
@@ -58,7 +58,12 @@ const fallbackModules = placeholderModules;
 
 const WS_BASE_URL = getWebSocketBaseUrl();
 const COURSE_MODULES_WS_ENDPOINT = `${WS_BASE_URL}/courses/hrm/modules`;
-const CANVAS_SNAPSHOT_DEBOUNCE_MS = 750;
+const CANVAS_SNAPSHOT_DEBOUNCE_MS = 1000;
+const MIC_CHUNK_SAMPLES = 3200;
+const MIC_SAMPLE_RATE = 16000;
+const MIC_RMS_THRESHOLD = 0.015;
+const MIC_HANGOVER_MS = 300;
+const MIC_PRE_ROLL_SAMPLES = Math.round(MIC_SAMPLE_RATE * 0.25);
 function isAudioStreamingSupported() {
   return (
     typeof window !== "undefined" &&
@@ -206,6 +211,43 @@ function trimFloat32Buffer(input: Float32Array, maxLength: number) {
   return input.slice(input.length - maxLength);
 }
 
+function waitForWebSocketOpen(socket: WebSocket) {
+  if (socket.readyState === WebSocket.OPEN) {
+    return Promise.resolve(socket);
+  }
+
+  if (socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+    return Promise.resolve(null);
+  }
+
+  return new Promise<WebSocket | null>((resolve) => {
+    const cleanup = () => {
+      socket.removeEventListener("open", handleOpen);
+      socket.removeEventListener("error", handleError);
+      socket.removeEventListener("close", handleClose);
+    };
+
+    const handleOpen = () => {
+      cleanup();
+      resolve(socket);
+    };
+
+    const handleError = () => {
+      cleanup();
+      resolve(null);
+    };
+
+    const handleClose = () => {
+      cleanup();
+      resolve(null);
+    };
+
+    socket.addEventListener("open", handleOpen, { once: true });
+    socket.addEventListener("error", handleError, { once: true });
+    socket.addEventListener("close", handleClose, { once: true });
+  });
+}
+
 function calculateRms(inputBuffer: Float32Array) {
   if (inputBuffer.length === 0) {
     return 0;
@@ -255,7 +297,11 @@ export default function DashboardPage() {
   const navigate = useNavigate();
 
   const moduleSocketRef = useRef<WebSocket | null>(null);
-  const tutorSocketRef = useRef<WebSocket | null>(null);
+  const tutorMicSocketRef = useRef<WebSocket | null>(null);
+  const tutorPlaybackSocketRef = useRef<WebSocket | null>(null);
+  const tutorCanvasInputSocketRef = useRef<WebSocket | null>(null);
+  const tutorCanvasOutputSocketRef = useRef<WebSocket | null>(null);
+  const tutorControlSocketRef = useRef<WebSocket | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -265,9 +311,7 @@ export default function DashboardPage() {
   const assistantAudioNextTimeRef = useRef<number>(0);
   const assistantAudioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const boardSnapshotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastCanvasSnapshotTextRef = useRef<string>("");
   const lastCanvasSnapshotVisionRef = useRef<string>("");
-  const isSendingCanvasTextSnapshotRef = useRef(false);
   const isSendingCanvasVisionSnapshotRef = useRef(false);
   const outboundAudioQueueRef = useRef<ArrayBuffer[]>([]);
   const outboundCanvasQueueRef = useRef<string[]>([]);
@@ -323,9 +367,7 @@ export default function DashboardPage() {
 
     disconnectTutorSession();
     pendingBoardCommandsRef.current = [];
-    lastCanvasSnapshotTextRef.current = "";
     lastCanvasSnapshotVisionRef.current = "";
-    isSendingCanvasTextSnapshotRef.current = false;
     isSendingCanvasVisionSnapshotRef.current = false;
     outboundAudioQueueRef.current = [];
     outboundCanvasQueueRef.current = [];
@@ -386,8 +428,20 @@ export default function DashboardPage() {
     }
   };
 
+  const getTutorSocket = (kind: "audio" | "canvas" | "control") => {
+    if (kind === "audio") {
+      return tutorMicSocketRef.current;
+    }
+
+    if (kind === "canvas") {
+      return tutorCanvasInputSocketRef.current;
+    }
+
+    return tutorControlSocketRef.current;
+  };
+
   const flushQueuedOutboundFrames = (kind: "audio" | "canvas" | "control") => {
-    const socket = tutorSocketRef.current;
+    const socket = getTutorSocket(kind);
 
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return;
@@ -586,35 +640,6 @@ export default function DashboardPage() {
     return null;
   };
 
-  const getToolCallId = (payload: unknown) => {
-    if (!payload || typeof payload !== "object") {
-      return null;
-    }
-
-    const candidate = payload as {
-      tool_call_id?: unknown;
-      id?: unknown;
-    };
-
-    const toolCallId = candidate.tool_call_id ?? candidate.id;
-    return typeof toolCallId === "string" && toolCallId.trim() ? toolCallId : null;
-  };
-
-  const sendToolResult = (payload: unknown, success: boolean, message: string) => {
-    const toolCallId = getToolCallId(payload);
-
-    if (!toolCallId) {
-      return;
-    }
-
-    enqueueOutboundJson("control", {
-      type: "tool_result",
-      tool_call_id: toolCallId,
-      success,
-      message,
-    });
-  };
-
   const applyBoardPayload = (payload: unknown) => {
     const command = extractBoardCommand(payload);
 
@@ -631,7 +656,6 @@ export default function DashboardPage() {
     };
 
     if (!candidate.action) {
-      sendToolResult(payload, false, "Whiteboard command was missing an action.");
       return false;
     }
 
@@ -646,17 +670,14 @@ export default function DashboardPage() {
     ) {
       try {
         applyBoardCommand(boardEditor, candidate as BoardCommand);
-        sendToolResult(payload, true, "Whiteboard command applied on the frontend.");
         scheduleBoardSnapshot();
         return true;
       } catch (error) {
         console.error("Could not apply tutor board command", error);
-        sendToolResult(payload, false, error instanceof Error ? error.message : "Whiteboard command failed on the frontend.");
         return false;
       }
     }
 
-    sendToolResult(payload, false, `Unsupported whiteboard action: ${candidate.action}`);
     return false;
   };
 
@@ -710,6 +731,45 @@ export default function DashboardPage() {
           x: Number((end as { x?: unknown }).x ?? 140) || 0,
           y: Number((end as { y?: unknown }).y ?? 0) || 0,
         };
+      }
+    }
+
+    if (normalized.type === "draw") {
+      const rawSegments = Array.isArray(normalized.props.segments) ? normalized.props.segments : [];
+      normalized.props.segments = rawSegments.map((segment: any) => {
+        const normalizedSegment = segment && typeof segment === "object" && !Array.isArray(segment)
+          ? { ...segment }
+          : {};
+
+        if (normalizedSegment.type !== "free" && normalizedSegment.type !== "straight") {
+          normalizedSegment.type = "free";
+        }
+
+        if (typeof normalizedSegment.path !== "string") {
+          normalizedSegment.path = "";
+        }
+
+        return normalizedSegment;
+      });
+
+      if (typeof normalized.props.isComplete !== "boolean") {
+        normalized.props.isComplete = true;
+      }
+
+      if (typeof normalized.props.isPen !== "boolean") {
+        normalized.props.isPen = false;
+      }
+
+      if (typeof normalized.props.scale !== "number") {
+        normalized.props.scale = 1;
+      }
+
+      if (typeof normalized.props.scaleX !== "number") {
+        normalized.props.scaleX = 1;
+      }
+
+      if (typeof normalized.props.scaleY !== "number") {
+        normalized.props.scaleY = 1;
       }
     }
 
@@ -778,18 +838,16 @@ export default function DashboardPage() {
   }, [boardEditor]);
 
   const stopMicStream = () => {
-    const socket = tutorSocketRef.current;
+    const socket = tutorMicSocketRef.current;
     if (socket && socket.readyState === WebSocket.OPEN) {
       while (micPendingSamplesRef.current.length > 0) {
-        const chunk = micPendingSamplesRef.current.slice(0, 1600);
-        micPendingSamplesRef.current = micPendingSamplesRef.current.slice(1600);
+        const chunk = micPendingSamplesRef.current.slice(0, MIC_CHUNK_SAMPLES);
+        micPendingSamplesRef.current = micPendingSamplesRef.current.slice(MIC_CHUNK_SAMPLES);
 
         if (chunk.length > 0) {
           enqueueOutboundAudio(float32To16BitPCM(chunk));
         }
       }
-
-      enqueueOutboundJson("control", { type: "audio_stream_end" });
     }
 
     audioProcessorRef.current?.disconnect();
@@ -809,6 +867,10 @@ export default function DashboardPage() {
     audioStreamRef.current?.getTracks().forEach((track) => track.stop());
     audioStreamRef.current = null;
 
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.close();
+    }
+
     setIsRecording(false);
     setIsMicConnecting(false);
   };
@@ -818,9 +880,7 @@ export default function DashboardPage() {
     stopMicStream();
     stopAssistantAudio();
     pendingBoardCommandsRef.current = [];
-    lastCanvasSnapshotTextRef.current = "";
     lastCanvasSnapshotVisionRef.current = "";
-    isSendingCanvasTextSnapshotRef.current = false;
     isSendingCanvasVisionSnapshotRef.current = false;
     outboundAudioQueueRef.current = [];
     outboundCanvasQueueRef.current = [];
@@ -829,50 +889,28 @@ export default function DashboardPage() {
     outboundCanvasFlushScheduledRef.current = false;
     outboundControlFlushScheduledRef.current = false;
 
-    const socket = tutorSocketRef.current;
-    tutorSocketRef.current = null;
+    const audioSocket = tutorMicSocketRef.current;
+    const playbackSocket = tutorPlaybackSocketRef.current;
+    const canvasInputSocket = tutorCanvasInputSocketRef.current;
+    const canvasOutputSocket = tutorCanvasOutputSocketRef.current;
+    const controlSocket = tutorControlSocketRef.current;
+    tutorMicSocketRef.current = null;
+    tutorPlaybackSocketRef.current = null;
+    tutorCanvasInputSocketRef.current = null;
+    tutorCanvasOutputSocketRef.current = null;
+    tutorControlSocketRef.current = null;
     setIsTutorConnected(false);
     setIsTutorConnecting(false);
 
-    if (socket && socket.readyState !== WebSocket.CLOSED) {
-      socket.close();
-    }
-  };
-
-  const sendCanvasTextSnapshot = async () => {
-    const socket = tutorSocketRef.current;
-
-    if (!boardEditor || !socket || socket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    if (isSendingCanvasTextSnapshotRef.current) {
-      return;
-    }
-
-    isSendingCanvasTextSnapshotRef.current = true;
-
-    try {
-      const snapshot = await serializeTldrawJson(boardEditor);
-      if (snapshot === lastCanvasSnapshotTextRef.current) {
-        return;
+    [audioSocket, playbackSocket, canvasInputSocket, canvasOutputSocket, controlSocket].forEach((socket) => {
+      if (socket && socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
       }
-
-      lastCanvasSnapshotTextRef.current = snapshot;
-
-      enqueueOutboundJson("canvas", {
-        type: "canvas_snapshot_text",
-        data: snapshot,
-      });
-    } catch (error) {
-      console.error("Could not serialize board snapshot:", error);
-    } finally {
-      isSendingCanvasTextSnapshotRef.current = false;
-    }
+    });
   };
 
   const sendCanvasVisionSnapshot = async () => {
-    const socket = tutorSocketRef.current;
+    const socket = tutorCanvasInputSocketRef.current;
 
     if (!boardEditor || !socket || socket.readyState !== WebSocket.OPEN) {
       return;
@@ -892,7 +930,7 @@ export default function DashboardPage() {
 
       const imageResult = await boardEditor.toImage(shapeIds, {
         bounds: boardEditor.getViewportPageBounds(),
-        format: "png",
+        format: "jpeg",
         scale: 1,
       });
 
@@ -923,9 +961,40 @@ export default function DashboardPage() {
 
     boardSnapshotTimerRef.current = setTimeout(() => {
       boardSnapshotTimerRef.current = null;
-      void sendCanvasTextSnapshot();
       void sendCanvasVisionSnapshot();
     }, CANVAS_SNAPSHOT_DEBOUNCE_MS);
+  };
+
+  const connectTutorMicSocket = async (token: string, sessionId: string) => {
+    const existingSocket = tutorMicSocketRef.current;
+
+    if (existingSocket?.readyState === WebSocket.OPEN) {
+      return existingSocket;
+    }
+
+    if (existingSocket && existingSocket.readyState === WebSocket.CONNECTING) {
+      return await waitForWebSocketOpen(existingSocket);
+    }
+
+    const micUrl = `${WS_BASE_URL}/live/audio/in?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId)}`;
+    const micSocket = new WebSocket(micUrl);
+    micSocket.binaryType = "arraybuffer";
+    tutorMicSocketRef.current = micSocket;
+
+    micSocket.onopen = () => {
+      console.info("[Tutor WS] Microphone websocket opened", { sessionId, socketUrl: micSocket.url });
+      flushQueuedOutboundFrames("audio");
+    };
+    micSocket.onerror = () => {
+      console.error("Tutor microphone websocket error.");
+    };
+    micSocket.onclose = () => {
+      if (tutorMicSocketRef.current === micSocket) {
+        tutorMicSocketRef.current = null;
+      }
+    };
+
+    return await waitForWebSocketOpen(micSocket);
   };
 
   const connectTutorSession = async () => {
@@ -956,60 +1025,190 @@ export default function DashboardPage() {
       return false;
     }
 
-    if (tutorSocketRef.current?.readyState === WebSocket.OPEN) {
+    const existingSockets = [
+      tutorPlaybackSocketRef.current,
+      tutorCanvasInputSocketRef.current,
+      tutorCanvasOutputSocketRef.current,
+      tutorControlSocketRef.current,
+    ];
+
+    if (existingSockets.every((socket) => socket?.readyState === WebSocket.OPEN)) {
       return true;
     }
 
-    if (tutorSocketRef.current?.readyState === WebSocket.CONNECTING) {
+    if (existingSockets.some((socket) => socket?.readyState === WebSocket.CONNECTING)) {
       return true;
     }
 
     setIsTutorConnecting(true);
 
-    return await new Promise<boolean>((resolve) => {
-      const socket = new WebSocket(
-        `${WS_BASE_URL}/live?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId)}`
-      );
-      socket.binaryType = "arraybuffer";
-      tutorSocketRef.current = socket;
+    const playbackUrl = `${WS_BASE_URL}/live/audio/out?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId)}`;
+    const canvasInputUrl = `${WS_BASE_URL}/live/canvas/in?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId)}`;
+    const canvasOutputUrl = `${WS_BASE_URL}/live/canvas/out?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId)}`;
+    const controlUrl = `${WS_BASE_URL}/live/control?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId)}`;
 
-      socket.onopen = () => {
-        console.info("[Tutor WS] Live websocket opened", {
-          sessionId,
-          socketUrl: socket.url,
-        });
+    return await new Promise<boolean>((resolve) => {
+      let playbackReady = false;
+      let canvasInputReady = false;
+      let canvasOutputReady = false;
+      let controlReady = false;
+      let playbackResolved = false;
+      let settled = false;
+
+      const finishIfReady = () => {
+        if (settled || playbackResolved || !playbackReady || !canvasInputReady || !canvasOutputReady || !controlReady) {
+          return;
+        }
+
+        playbackResolved = true;
+        settled = true;
         setIsTutorConnected(true);
         setIsTutorConnecting(false);
         setTutorNotice({
           type: "info",
           message: "Live call connected. You can now turn on the microphone to speak with the tutor.",
         });
-        socket.send(
-          JSON.stringify({
-            action: "start_session",
-            session_id: sessionId,
-          })
-        );
-
-        flushQueuedOutboundFrames("audio");
-        flushQueuedOutboundFrames("canvas");
-        flushQueuedOutboundFrames("control");
-
         void ensureAssistantAudioContext();
         resolve(true);
       };
 
-      socket.onmessage = (event) => {
+      const failSession = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        disconnectTutorSession();
+        resolve(false);
+      };
+
+      const playbackSocket = new WebSocket(playbackUrl);
+      playbackSocket.binaryType = "arraybuffer";
+      tutorPlaybackSocketRef.current = playbackSocket;
+      playbackSocket.onopen = () => {
+        console.info("[Tutor WS] Playback websocket opened", { sessionId, socketUrl: playbackSocket.url });
+        playbackReady = true;
+        finishIfReady();
+      };
+      playbackSocket.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
+          console.info("[Tutor WS] Received assistant audio chunk", {
+            bytes: event.data.byteLength,
+          });
           void playAssistantBinaryAudio(event.data);
           return;
         }
 
         if (event.data instanceof Blob) {
-          void event.data.arrayBuffer().then((buffer) => playAssistantBinaryAudio(buffer));
+          void event.data.arrayBuffer().then((buffer) => {
+            console.info("[Tutor WS] Received assistant audio blob", {
+              bytes: buffer.byteLength,
+            });
+            return playAssistantBinaryAudio(buffer);
+          });
+        }
+      };
+      playbackSocket.onerror = () => {
+        console.error("Tutor playback websocket error.");
+        failSession();
+      };
+      playbackSocket.onclose = () => {
+        if (tutorPlaybackSocketRef.current === playbackSocket) {
+          tutorPlaybackSocketRef.current = null;
+        }
+        if (!settled) {
+          setIsTutorConnected(false);
+          setIsTutorConnecting(false);
+        }
+      };
+
+      const canvasInputSocket = new WebSocket(canvasInputUrl);
+      tutorCanvasInputSocketRef.current = canvasInputSocket;
+      canvasInputSocket.onopen = () => {
+        console.info("[Tutor WS] Canvas input websocket opened", { sessionId, socketUrl: canvasInputSocket.url });
+        canvasInputReady = true;
+        flushQueuedOutboundFrames("canvas");
+        finishIfReady();
+      };
+      canvasInputSocket.onerror = () => {
+        console.error("Tutor canvas input websocket error.");
+        failSession();
+      };
+      canvasInputSocket.onclose = () => {
+        if (tutorCanvasInputSocketRef.current === canvasInputSocket) {
+          tutorCanvasInputSocketRef.current = null;
+        }
+        if (!settled) {
+          setIsTutorConnected(false);
+          setIsTutorConnecting(false);
+        }
+      };
+
+      const canvasOutputSocket = new WebSocket(canvasOutputUrl);
+      tutorCanvasOutputSocketRef.current = canvasOutputSocket;
+      canvasOutputSocket.onopen = () => {
+        console.info("[Tutor WS] Canvas output websocket opened", { sessionId, socketUrl: canvasOutputSocket.url });
+        canvasOutputReady = true;
+        finishIfReady();
+      };
+      canvasOutputSocket.onmessage = (event) => {
+        if (typeof event.data !== "string") {
           return;
         }
 
+        try {
+          const payload = JSON.parse(event.data);
+
+          if (payload.type === "tool_call") {
+            applyBoardPayload(payload);
+            return;
+          }
+
+          if (payload.type === "exec_js") {
+            executeCanvasScript(String(payload.code ?? ""));
+            return;
+          }
+
+          if (payload &&
+            typeof payload === "object" &&
+            "action" in payload &&
+            typeof payload.action === "string"
+          ) {
+            applyBoardPayload(payload);
+          }
+        } catch {
+          return;
+        }
+      };
+      canvasOutputSocket.onerror = () => {
+        console.error("Tutor canvas output websocket error.");
+        failSession();
+      };
+      canvasOutputSocket.onclose = () => {
+        if (tutorCanvasOutputSocketRef.current === canvasOutputSocket) {
+          tutorCanvasOutputSocketRef.current = null;
+        }
+        if (!settled) {
+          setIsTutorConnected(false);
+          setIsTutorConnecting(false);
+        }
+      };
+
+      const controlSocket = new WebSocket(controlUrl);
+      tutorControlSocketRef.current = controlSocket;
+      controlSocket.onopen = () => {
+        console.info("[Tutor WS] Control websocket opened", { sessionId, socketUrl: controlSocket.url });
+        controlReady = true;
+        controlSocket.send(
+          JSON.stringify({
+            action: "start_session",
+            session_id: sessionId,
+          })
+        );
+        flushQueuedOutboundFrames("control");
+        finishIfReady();
+      };
+      controlSocket.onmessage = (event) => {
         if (typeof event.data !== "string") {
           return;
         }
@@ -1022,66 +1221,29 @@ export default function DashboardPage() {
             return;
           }
 
-        if (payload.type === "system_error") {
-          setTutorNotice({
-            type: "error",
-            message: payload.content ?? payload.detail ?? "Tutor engine error",
-          });
-          disconnectTutorSession();
-          return;
-        }
-
-          if (payload.type === "assistant_audio") {
-            void playAssistantAudio(payload as AssistantAudioPayload);
-            return;
+          if (payload.type === "system_error") {
+            setTutorNotice({
+              type: "error",
+              message: payload.content ?? payload.detail ?? "Tutor engine error",
+            });
+            disconnectTutorSession();
           }
-
-          if (payload.type === "exec_js") {
-            const success = executeCanvasScript(String(payload.code ?? ""));
-            sendToolResult(
-              payload,
-              success,
-              success ? "Canvas JavaScript applied on the frontend." : "Canvas JavaScript could not be applied on the frontend."
-            );
-            return;
-          }
-
-          if (payload.type === "tool_call") {
-            applyBoardPayload(payload);
-            return;
-          }
-
-          if (
-            payload &&
-            typeof payload === "object" &&
-            "action" in payload &&
-            typeof payload.action === "string"
-          ) {
-            applyBoardPayload(payload);
-            return;
-          }
-
         } catch {
           return;
         }
       };
-
-      socket.onerror = () => {
-        console.error("Tutor websocket error.");
-        disconnectTutorSession();
-        resolve(false);
+      controlSocket.onerror = () => {
+        console.error("Tutor control websocket error.");
+        failSession();
       };
-
-      socket.onclose = () => {
-        clearBoardSnapshotTimer();
-        stopMicStream();
-
-        if (tutorSocketRef.current === socket) {
-          tutorSocketRef.current = null;
+      controlSocket.onclose = () => {
+        if (tutorControlSocketRef.current === controlSocket) {
+          tutorControlSocketRef.current = null;
         }
-
-        setIsTutorConnected(false);
-        setIsTutorConnecting(false);
+        if (!settled) {
+          setIsTutorConnected(false);
+          setIsTutorConnecting(false);
+        }
       };
     });
   };
@@ -1127,6 +1289,17 @@ export default function DashboardPage() {
       return;
     }
 
+    const token = localStorage.getItem("access_token");
+    const sessionId = activeSessionId;
+
+    if (!token || !sessionId) {
+      setTutorNotice({
+        type: "warning",
+        message: "Start a live call first so the microphone can connect to the study session.",
+      });
+      return;
+    }
+
     if (isRecording || isMicConnecting) {
       stopMicStream();
       stopAssistantAudio();
@@ -1134,7 +1307,7 @@ export default function DashboardPage() {
       return;
     }
 
-    if (!isTutorConnected || tutorSocketRef.current?.readyState !== WebSocket.OPEN) {
+    if (!isTutorConnected || tutorPlaybackSocketRef.current?.readyState !== WebSocket.OPEN) {
       setTutorNotice({
         type: "warning",
         message: "Start the live call first, then turn on the microphone to join the session.",
@@ -1158,7 +1331,7 @@ export default function DashboardPage() {
       });
       audioStreamRef.current = stream;
 
-      const socket = tutorSocketRef.current;
+      const socket = await connectTutorMicSocket(token, sessionId);
 
       if (!socket || socket.readyState !== WebSocket.OPEN) {
         stopMicStream();
@@ -1173,10 +1346,6 @@ export default function DashboardPage() {
       const processor = audioContext.createScriptProcessor(512, 1, 1);
       const silentGain = audioContext.createGain();
       silentGain.gain.value = 0;
-      const targetChunkSamples = 1600;
-      const preRollSamples = 2400;
-      const voiceThreshold = 0.006;
-      const silenceTimeoutMs = 550;
 
       processor.onaudioprocess = (event) => {
         if (socket.readyState !== WebSocket.OPEN) {
@@ -1190,50 +1359,49 @@ export default function DashboardPage() {
           return;
         }
 
-        const now = Date.now();
+        const now = performance.now();
         const rms = calculateRms(downsampled);
-        const isVoice = rms >= voiceThreshold;
-
-        micPreRollSamplesRef.current = trimFloat32Buffer(
-          appendFloat32Chunks(micPreRollSamplesRef.current, downsampled),
-          preRollSamples
-        );
+        const isVoice = rms >= MIC_RMS_THRESHOLD;
 
         if (isVoice) {
+          micLastVoiceAtRef.current = now;
+
           if (!micIsSpeakingRef.current) {
+            micIsSpeakingRef.current = true;
             micPendingSamplesRef.current = appendFloat32Chunks(micPreRollSamplesRef.current, micPendingSamplesRef.current);
             micPreRollSamplesRef.current = new Float32Array(0);
-            micIsSpeakingRef.current = true;
           }
 
-          micLastVoiceAtRef.current = now;
           micPendingSamplesRef.current = appendFloat32Chunks(micPendingSamplesRef.current, downsampled);
+        } else if (micIsSpeakingRef.current) {
+          micPendingSamplesRef.current = appendFloat32Chunks(micPendingSamplesRef.current, downsampled);
+        } else {
+          micPreRollSamplesRef.current = appendFloat32Chunks(micPreRollSamplesRef.current, downsampled);
+          micPreRollSamplesRef.current = trimFloat32Buffer(micPreRollSamplesRef.current, MIC_PRE_ROLL_SAMPLES);
+          return;
+        }
 
-          while (micPendingSamplesRef.current.length >= targetChunkSamples) {
-            const chunk = micPendingSamplesRef.current.slice(0, targetChunkSamples);
-            micPendingSamplesRef.current = micPendingSamplesRef.current.slice(targetChunkSamples);
-            enqueueOutboundAudio(float32To16BitPCM(chunk));
+        while (micPendingSamplesRef.current.length >= MIC_CHUNK_SAMPLES) {
+          const chunk = micPendingSamplesRef.current.slice(0, MIC_CHUNK_SAMPLES);
+          micPendingSamplesRef.current = micPendingSamplesRef.current.slice(MIC_CHUNK_SAMPLES);
+          enqueueOutboundAudio(float32To16BitPCM(chunk));
 
-            micChunkCountRef.current += 1;
-            if (micChunkCountRef.current % 20 === 0) {
-              console.info("[Tutor WS] Sent mic chunk", {
-                chunkNumber: micChunkCountRef.current,
-                downsampledSamples: chunk.length,
-                byteLength: chunk.length * 2,
-              });
-            }
+          micChunkCountRef.current += 1;
+          if (micChunkCountRef.current % 20 === 0) {
+            console.info("[Tutor WS] Sent mic chunk", {
+              chunkNumber: micChunkCountRef.current,
+              downsampledSamples: chunk.length,
+              byteLength: chunk.length * 2,
+            });
           }
-        } else if (micIsSpeakingRef.current && now - micLastVoiceAtRef.current >= silenceTimeoutMs) {
-          while (micPendingSamplesRef.current.length > 0) {
-            const chunk = micPendingSamplesRef.current.slice(0, targetChunkSamples);
-            micPendingSamplesRef.current = micPendingSamplesRef.current.slice(targetChunkSamples);
+        }
 
-            if (chunk.length > 0) {
-              enqueueOutboundAudio(float32To16BitPCM(chunk));
-            }
+        if (!isVoice && micIsSpeakingRef.current && now - micLastVoiceAtRef.current > MIC_HANGOVER_MS) {
+          if (micPendingSamplesRef.current.length > 0) {
+            enqueueOutboundAudio(float32To16BitPCM(micPendingSamplesRef.current));
+            micPendingSamplesRef.current = new Float32Array(0);
           }
 
-          enqueueOutboundJson("control", { type: "audio_stream_end" });
           micIsSpeakingRef.current = false;
           micLastVoiceAtRef.current = 0;
           micPreRollSamplesRef.current = new Float32Array(0);
@@ -1249,6 +1417,10 @@ export default function DashboardPage() {
       audioProcessorRef.current = processor;
       audioGainRef.current = silentGain;
 
+      console.info("[Tutor WS] Microphone audio pipeline started", {
+        sampleRate: audioContext.sampleRate,
+        socketOpen: socket.readyState === WebSocket.OPEN,
+      });
       setIsRecording(true);
       setIsMicConnecting(false);
       setTutorNotice({

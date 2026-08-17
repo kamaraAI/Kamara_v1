@@ -54,10 +54,6 @@ async function apiFetch(path: string, init: RequestInit) {
   }
 }
 
-async function readJson(response: Response) {
-  return await response.json().catch(() => ({}));
-}
-
 function buildSubscriptionError(payload: Partial<SubscriptionAccessResponse> & { upgrade_url?: string }) {
   const message = payload.message || "Upgrade required.";
   return new SubscriptionRequiredError(message, {
@@ -76,15 +72,11 @@ export async function checkSubscriptionFeature(payload: SubscriptionFeatureReque
     body: JSON.stringify(payload),
   });
 
-  const data = await readJson(response);
   if (!response.ok) {
-    if (data?.error_code === "subscription_required" || response.status === 402) {
-      throw buildSubscriptionError(data);
-    }
-    throw new Error(typeof data?.detail === "string" ? data.detail : "Could not verify your plan access.");
+    throw buildSubscriptionError(await response.json().catch(() => ({})));
   }
 
-  return data as SubscriptionAccessResponse;
+  return response.json();
 }
 
 export async function consumeSubscriptionFeature(payload: SubscriptionFeatureRequest): Promise<SubscriptionAccessResponse> {
@@ -97,18 +89,13 @@ export async function consumeSubscriptionFeature(payload: SubscriptionFeatureReq
     body: JSON.stringify(payload),
   });
 
-  const data = await readJson(response);
   if (!response.ok) {
-    if (data?.error_code === "subscription_required" || response.status === 402) {
-      throw buildSubscriptionError(data);
-    }
-    throw new Error(typeof data?.detail === "string" ? data.detail : "Could not use this feature.");
+    throw buildSubscriptionError(await response.json().catch(() => ({})));
   }
 
-  return data as SubscriptionAccessResponse;
+  return response.json();
 }
 
 export function isSubscriptionRequiredError(error: unknown): error is SubscriptionRequiredError {
-  return error instanceof SubscriptionRequiredError || Boolean(error && typeof error === "object" && (error as { code?: string }).code === "subscription_required");
+  return error instanceof SubscriptionRequiredError || (typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "subscription_required");
 }
-

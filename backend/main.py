@@ -101,6 +101,7 @@ async def debug_config():
     }
 
 
+
 app.include_router(router)
 app.include_router(waitlist_router)
 app.include_router(profile_router)
@@ -128,7 +129,6 @@ if __name__ == "__main__":
 
     print(f"Booting server on port {port} | Production Mode: {is_cloud_run or is_render}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=reload_setting)
-
 
 
 

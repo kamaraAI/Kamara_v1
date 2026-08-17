@@ -5,6 +5,7 @@ import { useNavigate } from "react-router";
 import { getGeneratedCourseStorageKey, submitCoursePrompt } from "./genie-api";
 import CourseModal from "./ongoing/courseModal";
 import { GenieChatPanel } from "./dash-component";
+import { isSubscriptionRequiredError } from "../subscription-api";
 
 type Course = {
   title: string;

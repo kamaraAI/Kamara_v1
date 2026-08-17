@@ -26,12 +26,14 @@ async def _forward_audio_frames(student_id: str, session, queue: asyncio.Queue):
             continue
 
         try:
-            await session.send_realtime_input(
-                audio=types.Blob(
-                    data=audio_data,
-                    mime_type="audio/pcm;rate=16000",
+                logger.info("Sending mic frame to Gemini for %s | bytes=%s", student_id, len(audio_data) if audio_data else 0)
+                await session.send_realtime_input(
+                    audio=types.Blob(
+                        data=audio_data,
+                        mime_type="audio/pcm;rate=16000",
+                    )
                 )
-            )
+                logger.debug("Sent mic frame to Gemini for %s", student_id)
         except ConnectionClosedError as exc:
             logger.warning("Gemini session closed while forwarding mic for %s: %s", student_id, str(exc))
             return
@@ -51,19 +53,23 @@ async def forward_frontend_mic_and_canvas_to_gemini(student_id: str, websocket, 
         asyncio.create_task(_forward_audio_frames(student_id, session, audio_queue)),
     ]
 
-    def _request_shutdown():
+    async def _request_shutdown():
         if not stop_event.is_set():
             stop_event.set()
             try:
-                audio_queue.put_nowait(None)
+                await audio_queue.put(None)
             except Exception:
                 pass
 
-    def _queue_frame(queue: asyncio.Queue, payload):
+    async def _queue_frame(queue: asyncio.Queue, payload):
         if stop_event.is_set():
             return
 
-        queue.put_nowait(payload)
+        try:
+            await queue.put(payload)
+        except Exception:
+            # Best-effort enqueue; if it fails, skip the frame.
+            return
 
     try:
         logger.info("Multimodal inbound streaming worker activated for %s", student_id)
@@ -89,7 +95,7 @@ async def forward_frontend_mic_and_canvas_to_gemini(student_id: str, websocket, 
                             event_type = parsed_payload.get("type")
 
                             if event_type == "audio_stream_end":
-                                _queue_frame(audio_queue, {"type": "audio_stream_end"})
+                                await _queue_frame(audio_queue, {"type": "audio_stream_end"})
                                 logger.info("Received audio stream end control event for %s", student_id)
                                 continue
 
@@ -116,7 +122,7 @@ async def forward_frontend_mic_and_canvas_to_gemini(student_id: str, websocket, 
                     if not audio_data:
                         continue
 
-                    _queue_frame(audio_queue, audio_data)
+                    await _queue_frame(audio_queue, audio_data)
                     logger.info(
                         "Queued inbound mic frame for %s | bytes=%s",
                         student_id,
@@ -135,7 +141,7 @@ async def forward_frontend_mic_and_canvas_to_gemini(student_id: str, websocket, 
 
             except (WebSocketDisconnect, RuntimeError):
                 logger.info("Connection drop detected for student %s. Stopping inbound worker thread.", student_id)
-                _request_shutdown()
+                await _request_shutdown()
                 return
             except json.JSONDecodeError as decode_err:
                 logger.warning("Skipping malformed canvas payload for %s: %s", student_id, str(decode_err))
@@ -150,7 +156,7 @@ async def forward_frontend_mic_and_canvas_to_gemini(student_id: str, websocket, 
     except Exception as fatal_err:
         logger.error("Non-fatal collapse caught inside inbound processor for %s: %s", student_id, str(fatal_err))
     finally:
-        _request_shutdown()
+        await _request_shutdown()
         for task in worker_tasks:
             task.cancel()
 

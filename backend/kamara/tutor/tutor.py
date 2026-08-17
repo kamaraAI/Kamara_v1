@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketState
 from .response_handler import receive_response_from_ai
 from .session_resume_store import load_session_resumption_handle
 from .task_handler import forward_frontend_mic_and_canvas_to_gemini
+from .toolset.tools import tools as board_tools
 
 load_dotenv()
 logger = logging.getLogger("KamaraLogger")
@@ -21,6 +22,25 @@ if not api_key:
 client = Client(api_key=api_key)
 
 
+def _live_tools() -> list[types.Tool]:
+    return [
+        types.Tool(function_declarations=board_tools["function_declarations"]),
+      #  types.Tool(function_declarations=canvas_tools["function_declarations"]),
+    ]
+
+
+def _realtime_input_config() -> types.RealtimeInputConfig:
+    return types.RealtimeInputConfig(
+        automaticActivityDetection=types.AutomaticActivityDetection(
+            disabled=False,
+            startOfSpeechSensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+            endOfSpeechSensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+            prefixPaddingMs=120,
+            silenceDurationMs=700,
+        )
+    )
+
+
 async def agent(student_id: str, websocket: WebSocket, system_prompt: str, session_id: str | None = None):
     """
     Orchestrates the Gemini Live session and bridges the browser WebSocket.
@@ -30,27 +50,16 @@ async def agent(student_id: str, websocket: WebSocket, system_prompt: str, sessi
     resume_handle = await load_session_resumption_handle(student_id, session_id)
     voice_only_prompt = f"{system_prompt}\n\n"
     
-    #(
-   #     "TEMPORARY SESSION MODE: Ignore any whiteboard, canvas, drawing, or tool instructions. "
-  #      "Do not call tools. Focus only on hearing the student's microphone input and speaking back continuously by audio.\n\n"
-  #      f"{system_prompt}"
-   # )
+  
 
     while websocket.client_state == WebSocketState.CONNECTED:
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
+            tools=_live_tools(),
             thinking_config=types.ThinkingConfig(thinking_level="minimal"),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             input_audio_transcription=types.AudioTranscriptionConfig(),
-            realtime_input_config={
-                "automatic_activity_detection": {
-                    "disabled": True,   # False
-                    "start_of_speech_sensitivity": types.StartSensitivity.START_SENSITIVITY_LOW,
-                    "end_of_speech_sensitivity": types.EndSensitivity.END_SENSITIVITY_LOW,
-                    "prefix_padding_ms": 120,
-                    "silence_duration_ms": 700,
-                }
-            },
+            realtime_input_config=_realtime_input_config(),
             context_window_compression=types.ContextWindowCompressionConfig(
                 trigger_tokens=120_000,
                 sliding_window=types.SlidingWindow(target_tokens=80_000),
